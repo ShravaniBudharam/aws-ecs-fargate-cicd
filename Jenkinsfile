@@ -22,6 +22,7 @@ pipeline {
 
         // Must match the container "name" in your ECS task definition
         CONTAINER_NAME = 'ecs-devops'
+        IMAGE_TAG = '${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}:${BUILD_NUMBER}'
     }
 
     stages {
@@ -29,20 +30,6 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scm
-
-                script {
-                    // Use first 7 characters of Git commit as Docker tag
-                    env.IMAGE_TAG = sh(
-                        script: 'git rev-parse --short=7 HEAD',
-                        returnStdout: true
-                    ).trim()
-
-                    env.IMAGE_NAME =
-                        "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}:${env.IMAGE_TAG}"
-
-                    echo "Git Commit: ${env.IMAGE_TAG}"
-                    echo "Docker Image: ${env.IMAGE_NAME}"
-                }
             }
         }
 
