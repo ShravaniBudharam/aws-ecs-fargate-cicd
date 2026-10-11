@@ -22,7 +22,8 @@ pipeline {
 
         // Must match the container "name" in your ECS task definition
         CONTAINER_NAME = 'ecs-devops'
-        IMAGE_TAG = '${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}:${BUILD_NUMBER}'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        IMAGE_NAME = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
     }
 
     stages {
