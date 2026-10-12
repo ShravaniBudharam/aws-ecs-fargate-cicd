@@ -1,0 +1,442 @@
+JENKINS PIPELINE — LINE-BY-LINE EXPLANATION
+===========================================
+
+OVERVIEW
+--------
+This Jenkinsfile automates deployment of a Java/Maven application to Amazon ECS using Docker and Amazon ECR.
+
+Workflow:
+1. Checkout source code from Git.
+2. Run Maven tests.
+3. Package the application.
+4. Build a Docker image.
+5. Log in to Amazon ECR.
+6. Push the image to ECR.
+7. Download the current ECS task definition and update its container image.
+8. Register a new task-definition revision.
+9. Update the ECS service and wait for it to become stable.
+10. Print deployment details and clean up temporary files.
+
+PREREQUISITES
+-------------
+The Jenkins agent needs Git, Java/Maven, Docker, AWS CLI, and jq. It also needs AWS credentials and suitable IAM permissions for ECR and ECS. The repository is expected to contain an `app` Maven project and a Dockerfile at the repository root.
+
+1. PIPELINE AND AGENT
+---------------------
+
+`pipeline {`
+Starts a Declarative Jenkins Pipeline. It defines the automated process Jenkins will run.
+
+`agent any`
+Allows Jenkins to run the pipeline on any available agent. That agent must have the tools this pipeline uses; Jenkins does not install them automatically.
+
+`environment {`
+Starts a block of environment variables that are available to pipeline steps.
+
+`AWS_REGION = 'us-east-1'`
+Sets the AWS region where the ECR and ECS resources are expected to exist.
+
+`AWS_ACCOUNT_ID = '570367131376'`
+Identifies the AWS account that owns the ECR registry.
+
+`ECR_REPOSITORY = 'ecs-devops-repo'`
+Names the Amazon Elastic Container Registry repository where the Docker image will be stored.
+
+`ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"`
+Builds the registry hostname from the account ID and region. Here it becomes:
+570367131376.dkr.ecr.us-east-1.amazonaws.com
+
+`ECS_CLUSTER = 'ecs-devops-cluster'`
+Names the ECS cluster that contains the service.
+
+`ECS_SERVICE = 'ecs-devops-service'`
+Names the ECS service that Jenkins will update. An ECS service maintains the desired number of running tasks.
+
+`ECS_TASK_FAMILY = 'ecs-devops-task'`
+Names the task-definition family. A task definition is a blueprint for an ECS task, including its container image, CPU/memory, ports, roles, environment variables, and logging configuration. Registering a new definition creates a new revision in this family.
+
+`CONTAINER_NAME = 'ecs-devops'`
+Names the container in the task definition whose image should be changed. It must exactly match a name in the task definition's `containerDefinitions` array.
+
+`IMAGE_TAG = "${BUILD_NUMBER}"`
+Uses Jenkins' automatic build number as the Docker image tag. For example, build 15 creates the tag `15`.
+
+`IMAGE_NAME = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"`
+Builds the complete Docker image reference. For build 15, it is:
+570367131376.dkr.ecr.us-east-1.amazonaws.com/ecs-devops-repo:15
+
+`}`
+Ends the environment block.
+
+2. STAGES
+---------
+`stages {`
+Starts the ordered list of stages. Jenkins normally runs them in sequence. If a stage fails, later stages are usually skipped.
+
+STAGE 1 — CHECKOUT
+------------------
+`stage('Checkout') {`
+Creates a stage called Checkout in the Jenkins interface.
+
+`steps {`
+Starts the commands for this stage.
+
+`checkout scm`
+Checks out the source code from the repository configured for the Jenkins job. `scm` means Source Code Management. The code becomes available in the Jenkins workspace.
+
+The closing braces end the steps block and the stage.
+
+STAGE 2 — MAVEN TEST
+--------------------
+`stage('Maven Test') {`
+Creates the Maven Test stage.
+
+`sh ''' ... '''`
+Runs the enclosed multi-line shell script on the Jenkins agent.
+
+`cd app`
+Changes into the `app` directory, where this pipeline expects the Maven `pom.xml` file.
+
+`mvn clean test`
+Runs Maven's clean and test goals:
+- `clean` removes previous build output, commonly the `target` directory.
+- `test` compiles the required source and test code and runs the configured tests, such as JUnit tests.
+
+If a test fails, Maven normally returns a non-zero exit code. Jenkins marks the stage as failed and does not proceed with the ordinary later deployment stages. This helps prevent deployment of code that failed testing.
+
+STAGE 3 — MAVEN PACKAGE
+-----------------------
+`stage('Maven Package') {`
+Creates the packaging stage.
+
+`cd app`
+Enters the Maven project directory again. Each `sh` step generally starts a new shell, so the previous stage's directory change does not carry over.
+
+`mvn package -DskipTests`
+Packages the Java application, commonly producing a JAR under `app/target/`.
+- `package` runs Maven's packaging lifecycle.
+- `-DskipTests` skips executing tests in this command. The earlier stage already ran `mvn clean test`.
+
+Depending on the Maven configuration, test source code may still be compiled even when test execution is skipped.
+
+The Dockerfile must copy the generated artifact from the correct path. Since the Docker build later uses the repository root as its context, a root-level Dockerfile typically needs a path such as `app/target/...` when copying the JAR.
+
+STAGE 4 — DOCKER BUILD
+----------------------
+`stage('Docker Build') {`
+Creates the Docker Build stage.
+
+`docker build -t "${IMAGE_NAME}" .`
+Builds a Docker image:
+- `docker build` starts the image build.
+- `-t "${IMAGE_NAME}"` assigns the full ECR image name and build-number tag.
+- `.` means the current directory is the build context, normally the repository root after checkout.
+
+The Dockerfile and files it references must be available inside this build context.
+
+STAGE 5 — ECR LOGIN
+-------------------
+`stage('ECR Login') {`
+Creates the stage that authenticates Docker to Amazon ECR.
+
+`aws ecr get-login-password --region "${AWS_REGION}" |`
+Asks the AWS CLI for an ECR authentication password for the selected region. The pipe (`|`) sends the password to the next command through standard input.
+
+`docker login --username AWS --password-stdin "${ECR_REGISTRY}"`
+Logs Docker in to the ECR registry:
+- `--username AWS` is the username used for ECR authentication.
+- `--password-stdin` reads the password from the pipe rather than putting it directly in the command.
+- `${ECR_REGISTRY}` identifies the registry.
+
+The Jenkins agent must already have valid AWS credentials and permission to authenticate to ECR.
+
+STAGE 6 — PUSH IMAGE TO ECR
+---------------------------
+`stage('Push Image to ECR') {`
+Creates the image-push stage.
+
+`echo "Pushing image: ${IMAGE_NAME}"`
+Prints the image reference in the Jenkins console.
+
+`docker push "${IMAGE_NAME}"`
+Uploads the local image to the ECR repository with that tag. The repository must exist, and the AWS identity used by Jenkins needs the required ECR permissions.
+
+Once pushed, ECS can pull the image when a task using the new task definition starts.
+
+STAGE 7 — PREPARE ECS TASK DEFINITION
+-------------------------------------
+`stage('Prepare ECS Task Definition') {`
+Creates the stage that retrieves the current task definition and prepares an updated JSON file.
+
+`aws ecs describe-task-definition ...`
+Requests the existing ECS task definition.
+
+`--task-definition "${ECS_TASK_FAMILY}"`
+Identifies the task-definition family. With no revision specified, ECS resolves the family to its latest active revision.
+
+`--region "${AWS_REGION}"`
+Specifies the AWS region.
+
+`--query taskDefinition`
+Uses the AWS CLI's JMESPath query to extract the `taskDefinition` object from the larger response.
+
+`--output json > taskdef.json`
+Formats the object as JSON and saves it to `taskdef.json`. The `>` operator creates or overwrites the file in the Jenkins workspace.
+
+`jq --arg IMAGE "${IMAGE_NAME}" --arg CONTAINER "${CONTAINER_NAME}" ' ... ' taskdef.json > taskdef-new.json`
+Uses `jq`, a JSON-processing command-line tool, to create a modified task-definition file.
+
+- `--arg IMAGE "${IMAGE_NAME}"` passes the new image reference into jq as `$IMAGE`.
+- `--arg CONTAINER "${CONTAINER_NAME}"` passes the target container name as `$CONTAINER`.
+- `taskdef.json` is the input file.
+- `> taskdef-new.json` saves the result into a separate output file, leaving the original unchanged.
+
+Inside the jq expression:
+
+`del(...)`
+Removes fields returned by ECS that should not be sent back as registration input:
+- `.taskDefinitionArn`: ARN of the existing revision.
+- `.revision`: existing revision number.
+- `.status`: current status.
+- `.requiresAttributes`: attributes associated with the existing definition.
+- `.compatibilities`: compatibility information.
+- `.registeredAt`: registration time.
+- `.registeredBy`: registering identity.
+- `.deregisteredAt`: deregistration timestamp, if present.
+
+This removes metadata from the JSON being prepared; it does not delete the existing AWS task definition.
+
+`|`
+Passes the resulting JSON object into the next jq expression.
+
+`if any(.containerDefinitions[]; .name == $CONTAINER)`
+Checks whether at least one container definition has a `name` matching `$CONTAINER`. The `[]` iterates through the container definitions.
+
+`then`
+Runs the next expression if a matching container exists.
+
+`.containerDefinitions |= map(...)`
+Updates the container definitions array. `map` applies the expression to each container and returns an updated array.
+
+`if .name == $CONTAINER`
+Checks the name of each container.
+
+`then .image = $IMAGE`
+For the matching container only, changes the image field to the new ECR image reference.
+
+`else .`
+Returns every non-matching container unchanged. This preserves sidecars and other containers.
+
+`end`
+Ends the inner conditional expression.
+
+`else error("Container name not found in task definition")`
+If no container matches, jq raises an error instead of silently registering a task definition with the wrong image.
+
+`end`
+Ends the outer conditional expression.
+
+The result is a task-definition JSON file that preserves the existing configuration while changing the selected container's image.
+
+STAGE 8 — REGISTER ECS TASK DEFINITION
+--------------------------------------
+`stage('Register ECS Task Definition') {`
+Creates a new ECS task-definition revision.
+
+`aws ecs register-task-definition ...`
+Calls the ECS API to register the definition.
+
+`--cli-input-json file://taskdef-new.json`
+Reads the registration request from the local `taskdef-new.json` file. The `file://` prefix tells the AWS CLI to use a file as input.
+
+`--region "${AWS_REGION}"`
+Specifies the AWS region.
+
+`--query 'taskDefinition.taskDefinitionArn'`
+Extracts the ARN of the newly registered task definition from the AWS CLI response. An ARN is an AWS resource identifier.
+
+`--output text > new-task-definition-arn.txt`
+Writes the ARN as plain text into `new-task-definition-arn.txt`.
+
+`echo "Registered task definition:"`
+Prints a label.
+
+`cat new-task-definition-arn.txt`
+Displays the ARN so you can see which revision was registered.
+
+Registering the task definition creates a revision but does not, by itself, change the running service. The next stage does that.
+
+STAGE 9 — DEPLOY TO ECS
+-----------------------
+`stage('Deploy to ECS') {`
+Creates the deployment stage.
+
+`NEW_TASK_DEF=$(cat new-task-definition-arn.txt)`
+Reads the ARN from the previous stage and stores it in the shell variable `NEW_TASK_DEF`. This is a shell variable for this script, not a pipeline-wide Jenkins environment variable.
+
+`echo "Updating ECS service to: ${NEW_TASK_DEF}"`
+Prints which task-definition revision will be deployed.
+
+`aws ecs update-service ...`
+Calls the ECS API to update the service.
+
+`--cluster "${ECS_CLUSTER}"`
+Identifies the ECS cluster.
+
+`--service "${ECS_SERVICE}"`
+Identifies the service to update.
+
+`--task-definition "${NEW_TASK_DEF}"`
+Tells the service to use the newly registered task-definition revision. ECS starts a deployment and replaces tasks according to the service's deployment configuration.
+
+`--region "${AWS_REGION}"`
+Specifies the AWS region.
+
+`echo "Waiting for ECS service to become stable..."`
+Prints a message before waiting.
+
+`aws ecs wait services-stable ...`
+Runs an AWS CLI waiter that repeatedly checks the service until it meets the waiter's stable-state criteria or the waiter times out.
+
+`--cluster`, `--services`, and `--region`
+Identify the cluster, service, and region to check.
+
+If the waiter times out or returns an error, the shell step normally fails and Jenkins marks the stage as failed.
+
+`echo "ECS deployment completed successfully!"`
+Prints a success message if the earlier commands in the shell script succeeded. Service stability does not guarantee that every application function or URL works, so a separate smoke test can provide stronger verification.
+
+STAGE 10 — DEPLOYMENT VERIFICATION
+----------------------------------
+`stage('Deployment Verification') {`
+Creates a final stage to inspect the ECS service.
+
+`aws ecs describe-services ...`
+Requests details about the specified service.
+
+`--cluster "${ECS_CLUSTER}"`
+Selects the cluster.
+
+`--services "${ECS_SERVICE}"`
+Selects the service.
+
+`--region "${AWS_REGION}"`
+Specifies the region.
+
+`--query 'services[0].{ ... }'`
+Uses JMESPath to select fields from the AWS CLI response.
+
+- `services` is the array of service objects returned by `describe-services`.
+- `[0]` selects the first service object. Since the command requests one service by name, that element is expected to represent the requested service.
+- `{ ... }` creates a new object containing only the requested fields.
+
+`Status:status`
+Shows the ECS service resource status, commonly `ACTIVE`. This does not by itself prove that the application has no errors.
+
+`Desired:desiredCount`
+Shows how many tasks the service is configured to maintain.
+
+`Running:runningCount`
+Shows how many tasks are currently running.
+
+`Pending:pendingCount`
+Shows how many tasks are pending or starting.
+
+`TaskDefinition:taskDefinition`
+Shows the task-definition ARN currently associated with the service.
+
+`Deployments:deployments[*].rolloutState`
+Reads the `deployments` array and extracts each deployment's rollout state where available. The `[*]` means “for every element in this array.”
+
+`--output json`
+Prints the selected fields in JSON format.
+
+How to interpret the output:
+- `Desired` and `Running` matching is generally a positive sign.
+- `Pending: 0` generally means no tasks are currently pending.
+- `TaskDefinition` should correspond to the revision the pipeline deployed.
+- If values look wrong, inspect ECS service events, stopped-task reasons, and CloudWatch logs.
+
+This stage prints information but does not explicitly fail the build if `Running` is less than `Desired`, and it does not make an HTTP request to the application. Add explicit assertions and an application smoke test if you need stricter verification.
+
+3. POST ACTIONS
+---------------
+`post {`
+Starts the post-build actions.
+
+`success {`
+Runs when the pipeline succeeds.
+
+`echo 'DEPLOYMENT SUCCESSFUL'`
+Prints a success message.
+
+`echo "Docker Image: ${env.IMAGE_NAME}"`
+Prints the image used. `env.IMAGE_NAME` refers to the Jenkins environment variable.
+
+`echo "ECS Cluster: ${env.ECS_CLUSTER}"`
+Prints the cluster name.
+
+`echo "ECS Service: ${env.ECS_SERVICE}"`
+Prints the service name.
+
+`failure {`
+Runs when the pipeline fails.
+
+`echo 'DEPLOYMENT FAILED'`
+Prints a failure message.
+
+`echo 'Check Jenkins console output for the failed stage.'`
+Directs you to the console log to find the failed command and its error.
+
+`always {`
+Runs the cleanup actions regardless of whether the pipeline succeeded or failed, provided Jenkins can execute the post step on the agent.
+
+`rm -f taskdef.json`
+Removes the downloaded task-definition JSON file. `-f` means not to report an error if the file is missing.
+
+`rm -f taskdef-new.json`
+Removes the modified JSON file.
+
+`rm -f new-task-definition-arn.txt`
+Removes the text file containing the new task-definition ARN.
+
+These commands remove temporary workspace files only. They do not delete ECS resources, the registered task-definition revision, or the pushed ECR image.
+
+4. COMPLETE WORKFLOW IN SIMPLE WORDS
+------------------------------------
+1. Jenkins downloads the source code.
+2. Maven runs the tests.
+3. Maven packages the Java application.
+4. Docker builds an image tagged with the Jenkins build number.
+5. Jenkins logs in to ECR.
+6. Jenkins pushes the image to ECR.
+7. Jenkins retrieves the current ECS task definition and changes the image for the container named `ecs-devops`.
+8. Jenkins registers a new task-definition revision.
+9. Jenkins updates the ECS service to use that revision.
+10. Jenkins waits for ECS to report a stable service.
+11. Jenkins prints service status and task counts.
+12. Jenkins reports success or failure and removes temporary files.
+
+5. COMMON ERRORS AND CHECKS
+---------------------------
+- `mvn: command not found`: Maven is missing or not on PATH.
+- Docker daemon or permission error: Docker may not be running, or the Jenkins user may lack access.
+- AWS credentials or `AccessDenied`: configure valid credentials and the required IAM permissions.
+- ECR repository not found: verify the account, region, repository name, and repository creation.
+- `Container name not found in task definition`: ensure `CONTAINER_NAME` exactly matches the task definition.
+- `jq: command not found`: install jq on the Jenkins agent.
+- ECS waiter timeout: inspect ECS service events, stopped-task reasons, image-pull access, networking, health checks, and CloudWatch logs.
+- JAR not found during Docker build: check the Maven output path and Dockerfile `COPY` instruction.
+
+SECURITY AND RELIABILITY NOTES
+------------------------------
+- Prefer an IAM role for the Jenkins agent or securely managed Jenkins credentials. Do not hardcode AWS access keys in the Jenkinsfile.
+- Follow least privilege for ECR and ECS permissions.
+- Verify that the Dockerfile copies the correct JAR from `app/target/`.
+- Consider tagging images with the Git commit SHA so a deployment can be traced to source code.
+- Add a smoke test and explicit checks for task counts/rollout state if deployment verification must fail automatically when the application is unhealthy.
+- The test and package commands are separate Maven invocations. Review the Maven configuration to ensure the artifact packaged is the intended one.
+
+ONE-SENTENCE SUMMARY
+--------------------
+This Jenkinsfile tests and packages the Java application, builds and pushes a versioned Docker image to ECR, registers a new ECS task-definition revision, deploys it through the ECS service, prints verification details, and cleans up temporary workspace files.
